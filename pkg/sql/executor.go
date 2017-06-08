@@ -697,7 +697,6 @@ func (e *Executor) execParsed(
 	for len(stmts) > 0 {
 		// Each iteration consumes a transaction's worth of statements.
 
-		inTxn := txnState.State != NoTxn
 		execOpt := client.TxnExecOptions{
 			AssignTimestampImmediately: true,
 		}
@@ -711,7 +710,7 @@ func (e *Executor) execParsed(
 		// We can AutoRetry the next batch of statements if we're in a clean state
 		// (i.e. the next statements we're going to see are the first statements in
 		// a transaction).
-		if !inTxn {
+		if txnState.State == NoTxn {
 			// Detect implicit transactions.
 			if _, isBegin := stmts[0].AST.(*parser.BeginTransaction); !isBegin {
 				execOpt.AutoCommit = true
@@ -954,25 +953,63 @@ func runTxnAttempt(
 	avoidCachedDescriptors bool,
 	automaticRetryCount int,
 ) ([]Result, StatementList, error) {
-
+	var results []Result
+	txnState := &session.TxnState
 	// Ignore the state that might have been set by a previous try of this
 	// closure. By putting these modifications to txnState behind the
 	// automaticRetryCount condition, we guarantee that no asynchronous
 	// statements are still executing and reading from the state. This
 	// means that no synchronization is necessary to prevent data races.
 	if automaticRetryCount > 0 {
-		session.TxnState.State = origState
-		session.TxnState.commitSeen = false
+		txnState.State = origState
+		txnState.commitSeen = false
 	}
 
-	results, remainingStmts, err := e.execStmtsInCurrentTxn(
-		session, stmts, pinfo, opt.AutoCommit, /* implicitTxn */
-		opt.AutoRetry /* txnBeginning */, avoidCachedDescriptors, automaticRetryCount)
+	for i, stmt := range stmts {
+		if log.V(2) || logStatementsExecuteEnabled.Get() ||
+			log.HasSpanOrEvent(session.Ctx()) {
+			log.VEventf(session.Ctx(), 2, "executing %d/%d: %s", i+1, len(stmts), stmt)
+		}
 
-	if opt.AutoCommit && len(remainingStmts) > 0 {
-		panic("implicit txn failed to execute all stmts")
+		txnState.schemaChangers.curStatementIdx = i
+
+		res, nextState, err := e.execStmtInCurrentTxn(
+			session, stmt, pinfo, opt.AutoCommit,
+			opt.AutoRetry && i == 0, avoidCachedDescriptors, automaticRetryCount)
+
+		switch nextState {
+		case RollBack:
+			res = rollbackSQLTransaction(txnState)
+		case ResetToNoTxn:
+			txnState.resetStateAndTxn(NoTxn)
+		case ResetStateAndCleanUp:
+			txnState.updateStateAndCleanupOnErr(err, e)
+		case ResetToCommitWait:
+			txnState.resetStateAndTxn(CommitWait)
+		default:
+			txnState.State = nextState
+		}
+
+		results = append(results, res)
+		if err != nil {
+			// After an error happened, skip executing all the remaining statements
+			// in this batch.  This is Postgres behavior, and it makes sense as the
+			// protocol doesn't let you return results after an error.
+			return results, nil, err
+		}
+		if txnState.State == NoTxn {
+			if opt.AutoCommit && i < len(stmts) {
+				panic("implicit txn failed to execute all stmts")
+			}
+
+			// If the transaction is done, return the remaining statements to
+			// be executed as a different group.
+			return results, stmts[i+1:], nil
+		}
 	}
-	return results, remainingStmts, err
+
+	// If we got here, we've managed to consume all statements and we're still in a txn.
+	return results, nil, nil
 }
 
 // execStmtsInCurrentTxn consumes a prefix of stmts, namely the
@@ -1013,89 +1050,68 @@ func runTxnAttempt(
 //    have not been executed. Note that usually the error is not reflected in
 //    this last result; the caller is responsible copying it into the result
 //    after converting it adequately.
-func (e *Executor) execStmtsInCurrentTxn(
+func (e *Executor) execStmtInCurrentTxn(
 	session *Session,
-	stmts StatementList,
+	stmt Statement,
 	pinfo *parser.PlaceholderInfo,
 	implicitTxn bool,
-	txnBeginning bool,
+	firstInTxn bool,
 	avoidCachedDescriptors bool,
 	automaticRetryCount int,
-) ([]Result, StatementList, error) {
-	var results []Result
-
+) (Result, TxnStateEnum, error) {
 	txnState := &session.TxnState
 	if txnState.State == NoTxn {
 		panic("execStmtsInCurrentTransaction called outside of a txn")
 	}
 
-	for i, stmt := range stmts {
-		if log.V(2) || logStatementsExecuteEnabled.Get() ||
-			log.HasSpanOrEvent(session.Ctx()) {
-			log.VEventf(session.Ctx(), 2, "executing %d/%d: %s", i+1, len(stmts), stmt)
+	stmt.queryHandle = session.addActiveQuery(stmt)
+	defer session.removeActiveQuery(stmt.queryHandle)
+
+	var stmtStrBefore string
+	// TODO(nvanbenschoten): Constant literals can change their representation (1.0000 -> 1) when type checking,
+	// so we need to reconsider how this works.
+	if (e.cfg.TestingKnobs.CheckStmtStringChange && false) ||
+		(e.cfg.TestingKnobs.StatementFilter != nil) {
+		// We do "statement string change" if a StatementFilter is installed,
+		// because the StatementFilter relies on the textual representation of
+		// statements to not change from what the client sends.
+		stmtStrBefore = stmt.String()
+	}
+
+	var res Result
+	var nextState TxnStateEnum
+	var err error
+	// Run SHOW TRANSACTION STATUS in a separate code path so it is
+	// always guaranteed to execute regardless of the current transaction state.
+	if _, ok := stmt.AST.(*parser.ShowTransactionStatus); ok {
+		res, nextState, err = runShowTransactionState(session, implicitTxn)
+	} else {
+		switch txnState.State {
+		case Open:
+			res, nextState, err = e.execStmtInOpenTxn(
+				session, stmt, pinfo, implicitTxn, firstInTxn,
+				avoidCachedDescriptors, automaticRetryCount)
+		case Aborted, RestartWait:
+			res, nextState, err = e.execStmtInAbortedTxn(session, stmt)
+		case CommitWait:
+			res, nextState, err = e.execStmtInCommitWaitTxn(session, stmt)
+		default:
+			panic(fmt.Sprintf("unexpected txn state: %s", txnState.State))
 		}
-
-		txnState.schemaChangers.curStatementIdx = i
-
-		stmt.queryHandle = session.addActiveQuery(stmt)
-		defer session.removeActiveQuery(stmt.queryHandle)
-
-		var stmtStrBefore string
-		// TODO(nvanbenschoten): Constant literals can change their representation (1.0000 -> 1) when type checking,
-		// so we need to reconsider how this works.
 		if (e.cfg.TestingKnobs.CheckStmtStringChange && false) ||
 			(e.cfg.TestingKnobs.StatementFilter != nil) {
-			// We do "statement string change" if a StatementFilter is installed,
-			// because the StatementFilter relies on the textual representation of
-			// statements to not change from what the client sends.
-			stmtStrBefore = stmt.String()
-		}
-
-		var res Result
-		var err error
-		// Run SHOW TRANSACTION STATUS in a separate code path so it is
-		// always guaranteed to execute regardless of the current transaction state.
-		if _, ok := stmt.AST.(*parser.ShowTransactionStatus); ok {
-			res, err = runShowTransactionState(session, implicitTxn)
-		} else {
-			switch txnState.State {
-			case Open:
-				res, err = e.execStmtInOpenTxn(
-					session, stmt, pinfo, implicitTxn, txnBeginning && (i == 0), /* firstInTxn */
-					avoidCachedDescriptors, automaticRetryCount)
-			case Aborted, RestartWait:
-				res, err = e.execStmtInAbortedTxn(session, stmt)
-			case CommitWait:
-				res, err = e.execStmtInCommitWaitTxn(session, stmt)
-			default:
-				panic(fmt.Sprintf("unexpected txn state: %s", txnState.State))
+			if after := stmt.String(); after != stmtStrBefore {
+				panic(fmt.Sprintf("statement changed after exec; before:\n    %s\nafter:\n    %s",
+					stmtStrBefore, after))
 			}
-			if (e.cfg.TestingKnobs.CheckStmtStringChange && false) ||
-				(e.cfg.TestingKnobs.StatementFilter != nil) {
-				if after := stmt.String(); after != stmtStrBefore {
-					panic(fmt.Sprintf("statement changed after exec; before:\n    %s\nafter:\n    %s",
-						stmtStrBefore, after))
-				}
-			}
-		}
-		if filter := e.cfg.TestingKnobs.StatementFilter; filter != nil {
-			filter(session.Ctx(), stmt.String(), &res)
-		}
-		results = append(results, res)
-		if err != nil {
-			// After an error happened, skip executing all the remaining statements
-			// in this batch.  This is Postgres behavior, and it makes sense as the
-			// protocol doesn't let you return results after an error.
-			return results, nil, err
-		}
-		if txnState.State == NoTxn {
-			// If the transaction is done, return the remaining statements to
-			// be executed as a different group.
-			return results, stmts[i+1:], nil
 		}
 	}
-	// If we got here, we've managed to consume all statements and we're still in a txn.
-	return results, nil, nil
+
+	if filter := e.cfg.TestingKnobs.StatementFilter; filter != nil {
+		filter(session.Ctx(), stmt.String(), &res)
+	}
+
+	return res, nextState, err
 }
 
 // getTransactionState retrieves a text representation of the given state.
@@ -1108,7 +1124,9 @@ func getTransactionState(txnState *txnState, implicitTxn bool) string {
 }
 
 // runShowTransactionState returns the state of current transaction.
-func runShowTransactionState(session *Session, implicitTxn bool) (Result, error) {
+func runShowTransactionState(session *Session, implicitTxn bool) (Result, TxnStateEnum, error) {
+	txnState := &session.TxnState
+	nextState := txnState.State
 	var result Result
 	result.PGTag = (*parser.Show)(nil).StatementTag()
 	result.Type = (*parser.Show)(nil).StatementType()
@@ -1116,14 +1134,14 @@ func runShowTransactionState(session *Session, implicitTxn bool) (Result, error)
 	result.Rows = sqlbase.NewRowContainer(
 		session.makeBoundAccount(), sqlbase.ColTypeInfoFromResCols(result.Columns), 0,
 	)
-	state := getTransactionState(&session.TxnState, implicitTxn)
+	state := getTransactionState(txnState, implicitTxn)
 	if _, err := result.Rows.AddRow(
 		session.Ctx(), parser.Datums{parser.NewDString(state)},
 	); err != nil {
 		result.Rows.Close(session.Ctx())
-		return result, err
+		return result, nextState, err
 	}
-	return result, nil
+	return result, nextState, nil
 }
 
 // execStmtInAbortedTxn executes a statement in a txn that's in state
@@ -1131,7 +1149,7 @@ func runShowTransactionState(session *Session, implicitTxn bool) (Result, error)
 // - COMMIT / ROLLBACK: aborts the current transaction.
 // - ROLLBACK TO SAVEPOINT / SAVEPOINT: reopens the current transaction,
 //   allowing it to be retried.
-func (e *Executor) execStmtInAbortedTxn(session *Session, stmt Statement) (Result, error) {
+func (e *Executor) execStmtInAbortedTxn(session *Session, stmt Statement) (Result, TxnStateEnum, error) {
 	txnState := &session.TxnState
 	if txnState.State != Aborted && txnState.State != RestartWait {
 		panic("execStmtInAbortedTxn called outside of an aborted txn")
@@ -1140,14 +1158,13 @@ func (e *Executor) execStmtInAbortedTxn(session *Session, stmt Statement) (Resul
 	switch s := stmt.AST.(type) {
 	case *parser.CommitTransaction, *parser.RollbackTransaction:
 		if txnState.State == RestartWait {
-			return rollbackSQLTransaction(txnState), nil
+			return Result{}, RollBack, nil
 		}
 		// Reset the state to allow new transactions to start.
 		// The KV txn has already been rolled back when we entered the Aborted state.
 		// Note: postgres replies to COMMIT of failed txn with "ROLLBACK" too.
 		result := Result{PGTag: (*parser.RollbackTransaction)(nil).StatementTag()}
-		txnState.resetStateAndTxn(NoTxn)
-		return result, nil
+		return result, ResetToNoTxn, nil
 	case *parser.RollbackToSavepoint, *parser.Savepoint:
 		// We accept both the "ROLLBACK TO SAVEPOINT cockroach_restart" and the
 		// "SAVEPOINT cockroach_restart" commands to indicate client intent to
@@ -1162,18 +1179,17 @@ func (e *Executor) execStmtInAbortedTxn(session *Session, stmt Statement) (Resul
 			panic("unreachable")
 		}
 		if err := parser.ValidateRestartCheckpoint(spName); err != nil {
-			return Result{}, err
+			return Result{}, txnState.State, err
 		}
 		if txnState.State == RestartWait {
-			// Reset the state. Txn is Open again.
-			txnState.State = Open
 			// TODO(andrei/cdo): add a counter for user-directed retries.
-			return Result{}, nil
+			// Reset the state. Txn is Open again.
+			return Result{}, Open, nil
 		}
 		err := sqlbase.NewTransactionAbortedError(fmt.Sprintf(
 			"SAVEPOINT %s has not been used or a non-retriable error was encountered",
 			parser.RestartSavepointName))
-		return Result{}, err
+		return Result{}, Aborted, err
 	default:
 		if txnState.State == RestartWait {
 			err := sqlbase.NewTransactionAbortedError(
@@ -1183,17 +1199,16 @@ func (e *Executor) execStmtInAbortedTxn(session *Session, stmt Statement) (Resul
 			// there seems to be little point in staying in RestartWait (plus,
 			// higher-level code asserts that we're only in RestartWait when returning
 			// retryable errors to the client).
-			txnState.updateStateAndCleanupOnErr(err, e)
-			return Result{}, err
+			return Result{}, ResetStateAndCleanUp, err
 		}
-		return Result{}, sqlbase.NewTransactionAbortedError("" /* customMsg */)
+		return Result{}, Aborted, sqlbase.NewTransactionAbortedError("" /* customMsg */)
 	}
 }
 
 // execStmtInCommitWaitTxn executes a statement in a txn that's in state
 // CommitWait.
 // Everything but COMMIT/ROLLBACK causes errors. ROLLBACK is treated like COMMIT.
-func (e *Executor) execStmtInCommitWaitTxn(session *Session, stmt Statement) (Result, error) {
+func (e *Executor) execStmtInCommitWaitTxn(session *Session, stmt Statement) (Result, TxnStateEnum, error) {
 	txnState := &session.TxnState
 	if txnState.State != CommitWait {
 		panic("execStmtInCommitWaitTxn called outside of an aborted txn")
@@ -1203,11 +1218,10 @@ func (e *Executor) execStmtInCommitWaitTxn(session *Session, stmt Statement) (Re
 	case *parser.CommitTransaction, *parser.RollbackTransaction:
 		// Reset the state to allow new transactions to start.
 		result := Result{PGTag: (*parser.CommitTransaction)(nil).StatementTag()}
-		txnState.resetStateAndTxn(NoTxn)
-		return result, nil
+		return result, ResetToNoTxn, nil
 	default:
 		err := sqlbase.NewTransactionCommittedError()
-		return Result{}, err
+		return Result{}, txnState.State, err
 	}
 }
 
@@ -1258,8 +1272,9 @@ func (e *Executor) execStmtInOpenTxn(
 	firstInTxn bool,
 	avoidCachedDescriptors bool,
 	automaticRetryCount int,
-) (_ Result, err error) {
+) (_ Result, nextState TxnStateEnum, err error) {
 	txnState := &session.TxnState
+	nextState = txnState.State
 	if txnState.State != Open {
 		panic("execStmtInOpenTxn called outside of an open txn")
 	}
@@ -1276,7 +1291,7 @@ func (e *Executor) execStmtInOpenTxn(
 			if txnState.State != Open {
 				panic(fmt.Sprintf("unexpected txnState when cleaning up: %v", txnState.State))
 			}
-			txnState.updateStateAndCleanupOnErr(err, e)
+			nextState = ResetStateAndCleanUp
 		}
 	}()
 
@@ -1287,18 +1302,18 @@ func (e *Executor) execStmtInOpenTxn(
 	_, independentFromParallelStmts := stmt.AST.(parser.IndependentFromParallelizedPriors)
 	if !(parallelize || independentFromParallelStmts) {
 		if err := session.parallelizeQueue.Wait(); err != nil {
-			return Result{}, err
+			return Result{}, nextState, err
 		}
 	}
 
 	if implicitTxn && !stmtAllowedInImplicitTxn(stmt) {
-		return Result{}, errNoTransactionInProgress
+		return Result{}, nextState, errNoTransactionInProgress
 	}
 
 	switch s := stmt.AST.(type) {
 	case *parser.BeginTransaction:
 		if !firstInTxn {
-			return Result{}, errTransactionInProgress
+			return Result{}, nextState, errTransactionInProgress
 		}
 	case *parser.CommitTransaction:
 		// CommitTransaction is executed fully here; there's no planNode for it
@@ -1306,7 +1321,7 @@ func (e *Executor) execStmtInOpenTxn(
 		return commitSQLTransaction(txnState, commit)
 	case *parser.ReleaseSavepoint:
 		if err := parser.ValidateRestartCheckpoint(s.Savepoint); err != nil {
-			return Result{}, err
+			return Result{}, nextState, err
 		}
 		// ReleaseSavepoint is executed fully here; there's no planNode for it
 		// and a planner is not involved at all.
@@ -1315,22 +1330,22 @@ func (e *Executor) execStmtInOpenTxn(
 		// RollbackTransaction is executed fully here; there's no planNode for it
 		// and a planner is not involved at all.
 		// Notice that we don't return any errors on rollback.
-		return rollbackSQLTransaction(txnState), nil
+		return Result{}, RollBack, nil
 	case *parser.Savepoint:
 		if err := parser.ValidateRestartCheckpoint(s.Name); err != nil {
-			return Result{}, err
+			return Result{}, nextState, err
 		}
 		// We want to disallow SAVEPOINTs to be issued after a transaction has
 		// started running. The client txn's statement count indicates how many
 		// statements have been executed as part of this transaction.
 		if txnState.mu.txn.CommandCount() > 0 {
-			return Result{}, errors.Errorf("SAVEPOINT %s needs to be the first statement in a "+
+			return Result{}, nextState, errors.Errorf("SAVEPOINT %s needs to be the first statement in a "+
 				"transaction", parser.RestartSavepointName)
 		}
 		// Note that Savepoint doesn't have a corresponding plan node.
 		// This here is all the execution there is.
 		txnState.retryIntent = true
-		return Result{}, nil
+		return Result{}, nextState, nil
 	case *parser.RollbackToSavepoint:
 		err := parser.ValidateRestartCheckpoint(s.Savepoint)
 		// If commands have already been sent through the transaction,
@@ -1339,11 +1354,11 @@ func (e *Executor) execStmtInOpenTxn(
 		if err == nil && txnState.mu.txn.CommandCount() > 0 {
 			txnState.mu.txn.Proto().Restart(0, 0, hlc.Timestamp{})
 		}
-		return Result{}, err
+		return Result{}, nextState, err
 	case *parser.Prepare:
 		name := s.Name.String()
 		if session.PreparedStatements.Exists(name) {
-			return Result{}, pgerror.NewErrorf(pgerror.CodeDuplicateDatabaseError,
+			return Result{}, nextState, pgerror.NewErrorf(pgerror.CodeDuplicateDatabaseError,
 				"prepared statement %q already exists", name)
 		}
 		typeHints := make(parser.PlaceholderTypes, len(s.Types))
@@ -1351,16 +1366,16 @@ func (e *Executor) execStmtInOpenTxn(
 			typeHints[strconv.Itoa(i+1)] = parser.CastTargetToDatumType(t)
 		}
 		_, err := session.PreparedStatements.New(e, name, StatementList{{AST: s.Statement}}, len(s.Statement.String()), typeHints)
-		return Result{}, err
+		return Result{}, nextState, err
 	case *parser.Execute:
 		name := s.Name.String()
 		prepared, ok := session.PreparedStatements.Get(name)
 		if !ok {
-			return Result{}, pgerror.NewErrorf(pgerror.CodeInvalidSQLStatementNameError,
+			return Result{}, nextState, pgerror.NewErrorf(pgerror.CodeInvalidSQLStatementNameError,
 				"prepared statement %q does not exist", name)
 		}
 		if len(prepared.SQLTypes) != len(s.Params) {
-			return Result{}, pgerror.NewErrorf(pgerror.CodeSyntaxError,
+			return Result{}, nextState, pgerror.NewErrorf(pgerror.CodeSyntaxError,
 				"wrong number of parameters for prepared statement %q: expected %d, got %d",
 				name, len(prepared.SQLTypes), len(s.Params))
 		}
@@ -1369,25 +1384,25 @@ func (e *Executor) execStmtInOpenTxn(
 			idx := strconv.Itoa(i + 1)
 			typedExpr, err := sqlbase.SanitizeVarFreeExpr(e, prepared.SQLTypes[idx], "EXECUTE parameter", session.SearchPath)
 			if err != nil {
-				return Result{}, pgerror.NewError(pgerror.CodeFeatureNotSupportedError, err.Error())
+				return Result{}, nextState, pgerror.NewError(pgerror.CodeFeatureNotSupportedError, err.Error())
 			}
 			var p parser.Parser
 			if err := p.AssertNoAggregationOrWindowing(typedExpr, "EXECUTE parameters", session.SearchPath); err != nil {
-				return Result{}, err
+				return Result{}, nextState, err
 			}
 			qArgs[idx] = typedExpr
 		}
 		results, err := e.execPrepared(session, prepared,
 			&parser.PlaceholderInfo{Values: qArgs, Types: prepared.SQLTypes})
 		if err != nil {
-			return Result{}, err
+			return Result{}, nextState, err
 		}
 		// No need to check if len(results.ResultList) > 1 because execPrepared
 		// returns an error in that case.
 		if len(results.ResultList) == 0 {
-			return Result{}, nil
+			return Result{}, nextState, nil
 		}
-		return results.ResultList[0], nil
+		return results.ResultList[0], nextState, nil
 
 	case *parser.Deallocate:
 		if s.Name == "" {
@@ -1396,11 +1411,11 @@ func (e *Executor) execStmtInOpenTxn(
 			if found := session.PreparedStatements.Delete(
 				session.Ctx(), string(s.Name),
 			); !found {
-				return Result{}, pgerror.NewErrorf(pgerror.CodeInvalidSQLStatementNameError,
+				return Result{}, nextState, pgerror.NewErrorf(pgerror.CodeInvalidSQLStatementNameError,
 					"prepared statement %q does not exist", s.Name)
 			}
 		}
-		return Result{PGTag: s.StatementTag()}, nil
+		return Result{PGTag: s.StatementTag()}, nextState, nil
 	}
 
 	var p *planner
@@ -1452,7 +1467,7 @@ func (e *Executor) execStmtInOpenTxn(
 		}
 
 		sessionEventf(session, "ERROR: %v", err)
-		return Result{}, err
+		return Result{}, txnState.State, err
 	}
 
 	tResult := &traceResult{tag: result.PGTag, count: -1}
@@ -1463,7 +1478,7 @@ func (e *Executor) execStmtInOpenTxn(
 		tResult.count = result.Rows.Len()
 	}
 	sessionEventf(session, "%s done", tResult)
-	return result, nil
+	return result, txnState.State, nil
 }
 
 // stmtAllowedInImplicitTxn returns whether the statement is allowed in an
@@ -1506,7 +1521,7 @@ const (
 )
 
 // commitSqlTransaction commits a transaction.
-func commitSQLTransaction(txnState *txnState, commitType commitType) (Result, error) {
+func commitSQLTransaction(txnState *txnState, commitType commitType) (Result, TxnStateEnum, error) {
 	if txnState.State != Open {
 		panic(fmt.Sprintf("commitSqlTransaction called on non-open txn: %+v", txnState.mu.txn))
 	}
@@ -1518,18 +1533,19 @@ func commitSQLTransaction(txnState *txnState, commitType commitType) (Result, er
 		// auto-retry, COMMIT needs to finalize the transaction (it can't leave it
 		// in Aborted or RestartWait). Higher layers will handle this with the help
 		// of `txnState.commitSeen`, set above.
-		return Result{}, err
+		return Result{}, txnState.State, err
 	}
 
+	var nextState TxnStateEnum
 	switch commitType {
 	case release:
 		// We'll now be waiting for a COMMIT.
-		txnState.resetStateAndTxn(CommitWait)
+		nextState = ResetToCommitWait
 	case commit:
 		// We're done with this txn.
-		txnState.resetStateAndTxn(NoTxn)
+		nextState = ResetToNoTxn
 	}
-	return Result{PGTag: (*parser.CommitTransaction)(nil).StatementTag()}, nil
+	return Result{PGTag: (*parser.CommitTransaction)(nil).StatementTag()}, nextState, nil
 }
 
 // exectDistSQL converts a classic plan to a distributed SQL physical plan and

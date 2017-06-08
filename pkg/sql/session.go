@@ -705,6 +705,14 @@ const (
 	// The KV txn has been committed successfully through a RELEASE.
 	// Statements are rejected until a COMMIT is seen.
 	CommitWait
+	// We need to rollback and go to NoTxn
+	RollBack
+	// We need to clear state and go to NoTxn
+	ResetToNoTxn
+
+	ResetToCommitWait
+
+	ResetStateAndCleanUp
 )
 
 // Some states mean that a client.Txn is open, others don't.
