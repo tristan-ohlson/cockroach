@@ -1,0 +1,6 @@
+# LogicTest: default parallel-stmts distsql
+
+query I
+SELECT length(e'\\xDEADBEEF'::bytea)
+----
+4
